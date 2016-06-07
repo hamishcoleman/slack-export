@@ -1,0 +1,30 @@
+
+I needed to simply archive my slack history.  After looking at the available
+projects to do this, I was unable to find one that had no requirements on
+installing a bunch of other libraries.  Checking the Slack API specs, it
+seemed simple enough, so I reluctantly re-invented the wheel.
+
+Firstly, use the slack user interface to get an API token.
+
+All commands will show a summary output as well as creating a file with
+the raw json data in the current directory.
+
+Usage:
+
+    slack-export $TOKEN channels.list
+    slack-export $TOKEN channels.history [id..]
+    slack-export $TOKEN groups.list
+    slack-export $TOKEN users.list
+    slack-export $TOKEN im.list
+    slack-export $TOKEN im.history [id..]
+
+    slack-export $TOKEN
+        running the exporter without any command will run all the other
+        commands in sequence - essentially performing a full export.
+
+TODO
+
+Some features were not implemented:
+* groups.history
+* "mpim"
+
