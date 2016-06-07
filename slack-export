@@ -1,0 +1,263 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+#
+# Just export all my history from slack
+#
+# Copyright 2016 Hamish Coleman
+#
+
+use File::Spec;
+
+# allow the libs to be in the bin dir
+use FindBin;
+use lib File::Spec->catdir($FindBin::RealBin,"lib");
+use lib File::Spec->catdir($ENV{HOME},"s/bin/lib");
+
+use Data::Dumper;
+$Data::Dumper::Indent = 1;
+$Data::Dumper::Sortkeys = 1;
+$Data::Dumper::Quotekeys = 0;
+
+use LWP::UserAgent;
+use URI::Escape;
+use JSON;
+use IO::File;
+
+# FIXME - global;
+my $ua;
+my $token;
+my $db = {};
+
+sub hack_get($$) {
+    my $url = shift;
+    my $args = shift;
+
+    my @argarray;
+    while (my ($k,$v) = each %{$args}) {
+        if ($v) {
+            push @argarray, uri_escape($k).'='.uri_escape($v);
+        }
+    }
+
+    if (scalar(@argarray)) {
+        $url .= '?';
+        $url .= join('&',@argarray);
+    }
+
+    my $res = $ua->get($url);
+
+    if (!$res->is_success) {
+        # TODO - more? or even just die?
+        warn $res->status_line;
+        return undef;
+    }
+
+    if ($res->content_type ne 'application/json') {
+        warn "content_type != application/json";
+        return undef;
+    }
+
+    return decode_json $res->decoded_content;
+}
+
+sub generic_history($$) {
+    my $url = shift;
+    my $args = shift;
+
+    my $allresults;
+
+    my $r = hack_get($url,$args);
+    return undef if (!defined($r));
+    $allresults = $r;
+
+    my $i = 1;
+    while ($r->{has_more}) {
+        my $latest = $r->{messages}[-1]{ts};
+        $args->{latest}=$latest;
+        $r = hack_get($url,$args);
+        return $allresults if (!defined($r));
+        push @{$allresults->{messages}}, @{$r->{messages}};
+        $i++;
+    }
+
+    if ($i>1) {
+        $allresults->{_pages} = $i;
+    };
+    $allresults->{has_more}=0;
+    return $allresults;
+}
+
+sub channels_list() {
+    return hack_get("https://slack.com/api/channels.list",{token=>$token});
+}
+
+sub channels_history($) {
+    my $channel = shift;
+
+    return generic_history("https://aconex.slack.com/api/channels.history",
+        {token=>$token,channel=>$channel});
+}
+
+sub groups_list() {
+    return hack_get("https://slack.com/api/groups.list",{token=>$token});
+}
+
+sub ims_list() {
+    return hack_get("https://slack.com/api/im.list",{token=>$token});
+}
+
+sub ims_history($) {
+    my $channel = shift;
+
+    return generic_history("https://aconex.slack.com/api/im.history",
+        {token=>$token,channel=>$channel});
+}
+
+sub users_list() {
+    return hack_get("https://slack.com/api/users.list",{token=>$token});
+}
+
+sub write_json($$) {
+    my $filename = shift;
+    my $object = shift;
+
+    my $fh = IO::File->new($filename,"w") || return undef;
+
+    my $json = JSON->new->utf8->pretty->canonical;
+    
+    return $fh->write($json->encode($object));
+}
+
+sub generic_cmd_list(&$$$) {
+    my $fn = shift;
+    my $filename = shift;
+    my $results_fieldname = shift;
+    my $display_fieldname = shift;
+
+    my $r = &{$fn}();
+    write_json($filename,$r);
+
+    for my $i (@{$r->{$results_fieldname}}) {
+        print $i->{id}," ",$i->{$display_fieldname},"\n";
+    }
+    $db->{net}{$results_fieldname} = $r;
+    return $r;
+}
+
+sub generic_cmd_history(&$$@) {
+    my $fn = shift;
+    my $arrayref = shift;
+    my $filenameprefix = shift;
+    my @id_list = @_;
+
+    if (!scalar(@id_list)) {
+        # no list given, so assume default all entries
+        for my $i (@{$arrayref}) {
+            push @id_list,$i->{id};
+        }
+    }
+
+    for my $i (@id_list) {
+        print $i,"\n";
+        my $data = &{$fn}($i);
+        write_json($filenameprefix.$i,$data);
+    }
+}
+
+sub cmd_channels_list(@) {
+    return generic_cmd_list(\&channels_list,'channels.list','channels','name');
+}
+
+sub cmd_channels_history(@) {
+    return generic_cmd_history( \&channels_history,
+        $db->{net}{channels}{channels}, 'channels.history.', @_ );
+}
+
+sub cmd_groups_list(@) {
+    return generic_cmd_list(\&groups_list,'groups.list','groups','name');
+}
+
+sub cmd_users_list(@) {
+    return generic_cmd_list(\&users_list,'users.list','members','name');
+}
+
+sub cmd_ims_list(@) {
+    return generic_cmd_list(\&ims_list,'im.list','ims','user');
+}
+
+sub cmd_ims_history(@) {
+    return generic_cmd_history( \&ims_history,
+        $db->{net}{ims}{ims}, 'im.history.', @_ );
+}
+
+sub doitall() {
+    my $net = $db->{net};
+
+    cmd_channels_list();
+    cmd_channels_history();
+
+    print "\n";
+
+    cmd_groups_list();
+    # FIXME cmd_groups_history();
+
+    print "\n";
+
+    cmd_users_list();
+
+    # make a mapping of userid to human readable username
+    for my $i (@{$db->{net}{members}{members}}) {
+        $db->{users}{$i->{id}} = $i->{name};
+    }
+
+    print "\n";
+
+    cmd_ims_list();
+
+    # use the userid mapping to give names to the direct chat entries
+    for my $i (@{$net->{ims}{ims}}) {
+        print $i->{id}," ",$i->{user}," ",$db->{users}{$i->{user}}||'\N',"\n";
+    }
+
+    cmd_ims_history();
+
+    # FIXME mpim
+
+    #print Dumper($db);
+}
+
+sub main() {
+    $token = shift @ARGV || die "need token";
+
+    $ua = LWP::UserAgent->new;
+
+    my $cmd = shift @ARGV;
+    
+         if ($cmd eq 'channels.list') {
+        cmd_channels_list(@ARGV);
+    } elsif ($cmd eq 'channels.history') {
+        cmd_channels_history(@ARGV);
+    } elsif ($cmd eq 'groups.list') {
+        cmd_groups_list(@ARGV);
+    } elsif ($cmd eq 'users.list') {
+        cmd_users_list(@ARGV);
+    } elsif ($cmd eq 'im.list') {
+        cmd_ims_list(@ARGV);
+    } elsif ($cmd eq 'im.history') {
+        cmd_ims_history(@ARGV);
+    }
+
+    # FIXME cmd_groups_history();
+
+    elsif (!defined($cmd)) {
+        doitall();
+    }
+
+    else {
+        die("bad command");
+    }
+
+}
+main();
+
